@@ -23,6 +23,7 @@ type SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX struct {
 	ObjectTypeIndex       uint16
 	HandleAttributes      uint32
 	Reserved              uint32
+	UniqueThreadId        uintptr
 }
 
 type SYSTEM_HANDLE_INFORMATION_EX struct {
@@ -31,12 +32,17 @@ type SYSTEM_HANDLE_INFORMATION_EX struct {
 	Handles         [1]SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX
 }
 
+type DBHandleInfo struct {
+	Path     string
+	ThreadID uint32
+}
+
 var (
 	ntdll                 = windows.NewLazyDLL("ntdll.dll")
 	procNtQuerySystemInfo = ntdll.NewProc("NtQuerySystemInformation")
 )
 
-func enumP4DBHandlePaths(p4pid uint32) []string {
+func enumP4DBHandlesByThread(p4pid uint32) []DBHandleInfo {
 	bufSize := uint32(1 << 20)
 	buf := make([]byte, bufSize)
 
@@ -57,7 +63,7 @@ func enumP4DBHandlePaths(p4pid uint32) []string {
 	info := (*SYSTEM_HANDLE_INFORMATION_EX)(unsafe.Pointer(&buf[0]))
 	count := info.NumberOfHandles
 
-	var result []string
+	var result []DBHandleInfo
 
 	srcProc, err := windows.OpenProcess(windows.PROCESS_DUP_HANDLE, false, p4pid)
 	if err != nil {
@@ -94,7 +100,10 @@ func enumP4DBHandlePaths(p4pid uint32) []string {
 		windows.CloseHandle(dup)
 
 		if strings.Contains(strings.ToLower(name), `\db.`) {
-			result = append(result, name)
+			result = append(result, DBHandleInfo{
+				Path:     name,
+				ThreadID: uint32(h.UniqueThreadId),
+			})
 		}
 	}
 	return result

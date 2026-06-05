@@ -183,10 +183,10 @@ func main() {
 	// found it
 	fmt.Printf("p4s.exe pid: %d\n", p4p.ProcessID)
 	p4pid := uint32(p4p.ProcessID)
-	handlePaths := enumP4DBHandlePaths(p4pid)
-	println("db.* handles:", len(handlePaths))
-	for _, path := range handlePaths {
-		fmt.Println("db handle:", path)
+	handleInfos := enumP4DBHandlesByThread(p4pid)
+	println("db.* handles:", len(handleInfos))
+	for _, info := range handleInfos {
+		fmt.Printf("db handle: %s (thread %d)\n", info.Path, info.ThreadID)
 	}
 
 	session, _, _ := procOpenThreadWaitChainSession.Call(1, 0)
