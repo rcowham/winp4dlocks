@@ -14,17 +14,15 @@ import (
 
 const (
 	WCT_OBJNAME_LENGTH = 128
-	WctThreadType      = 1
+	WctThreadType      = 7
 )
 
 type WAITCHAIN_NODE_INFO struct {
-	ObjectType      uint32
-	ObjectStatus    uint32
-	Union           [16]byte
-	ObjectId        [2]uintptr
-	ContextSwitches uint32
-	WaitTime        uint32
-	Timeout         uint32
+	ObjectType   uint32
+	ObjectStatus uint32
+	// This mirrors the C union payload for WAITCHAIN_NODE_INFO on 64-bit builds.
+	// The largest arm is LockObject: WCHAR[128] + LARGE_INTEGER + BOOL (+ alignment).
+	ObjectInfo [272]byte
 }
 
 var (
@@ -68,7 +66,7 @@ func enumThreads(pid uint32) []uint32 {
 	return threads
 }
 
-func checkThreadBlockers(tid uint32, session uintptr) {
+func checkThreadBlockers(tid uint32, session uintptr) bool {
 	const WCT_MAX_NODE_COUNT = 16
 	var nodes [WCT_MAX_NODE_COUNT]WAITCHAIN_NODE_INFO
 	var count uint32 = WCT_MAX_NODE_COUNT
@@ -77,6 +75,7 @@ func checkThreadBlockers(tid uint32, session uintptr) {
 	r, _, _ := procGetThreadWaitChain.Call(
 		session,
 		0,
+		0,
 		uintptr(tid),
 		uintptr(unsafe.Pointer(&count)),
 		uintptr(unsafe.Pointer(&nodes[0])),
@@ -84,15 +83,25 @@ func checkThreadBlockers(tid uint32, session uintptr) {
 	)
 
 	if r == 0 || count < 2 {
-		return
+		return true // thread is not blocked
 	}
 
-	for i := 1; i < int(count); i++ {
-		if nodes[i].ObjectType == WctThreadType {
-			blocker := uint32(nodes[i].ObjectId[0])
-			println("Thread", tid, "blocked by thread", blocker)
-		}
+	// Check primary blocker (nodes[1])
+	if nodes[1].ObjectType == WctThreadType {
+		pid := *(*uint32)(unsafe.Pointer(&nodes[1].ObjectInfo[0]))
+		blocker := *(*uint32)(unsafe.Pointer(&nodes[1].ObjectInfo[4]))
+		println("Thread", tid, "blocked by thread", blocker, "(pid", pid, ")")
+		return false // thread is blocked
 	}
+
+	// Lock object name is WCHAR[WCT_OBJNAME_LENGTH] at ObjectInfo[0].
+	name := windows.UTF16ToString((*[WCT_OBJNAME_LENGTH]uint16)(unsafe.Pointer(&nodes[1].ObjectInfo[0]))[:])
+	if name != "" {
+		println("Thread", tid, "waiting on", name, "(type", nodes[1].ObjectType, "status", nodes[1].ObjectStatus, ")")
+	} else {
+		println("Thread", tid, "waiting on object type", nodes[1].ObjectType, "status", nodes[1].ObjectStatus)
+	}
+	return false
 }
 
 // WindowsProcess is an implementation of Process for Windows.
@@ -134,7 +143,7 @@ func processes() ([]WindowsProcess, error) {
 
 func findProcessByName(processes []WindowsProcess, name string) *WindowsProcess {
 	for _, p := range processes {
-		if strings.ToLower(p.Exe) == strings.ToLower(name) {
+		if strings.EqualFold(p.Exe, name) {
 			return &p
 		}
 	}
@@ -174,14 +183,30 @@ func main() {
 	// found it
 	fmt.Printf("p4s.exe pid: %d\n", p4p.ProcessID)
 	p4pid := uint32(p4p.ProcessID)
-	handles := enumP4DBHandles(p4pid)
-	println("db.* handles:", len(handles))
+	handlePaths := enumP4DBHandlePaths(p4pid)
+	println("db.* handles:", len(handlePaths))
+	for _, path := range handlePaths {
+		fmt.Println("db handle:", path)
+	}
 
 	session, _, _ := procOpenThreadWaitChainSession.Call(1, 0)
 	defer procCloseThreadWaitChainSession.Call(session)
 
 	threads := enumThreads(p4pid)
+	fmt.Println("\n--- Thread Lock Status ---")
+	var activeLockHolders []uint32
+
 	for _, tid := range threads {
-		checkThreadBlockers(tid, session)
+		isActive := checkThreadBlockers(tid, session)
+		if isActive {
+			activeLockHolders = append(activeLockHolders, tid)
+		}
+	}
+
+	if len(activeLockHolders) > 0 {
+		fmt.Println("\nThreads likely holding locks (not blocked):")
+		for _, tid := range activeLockHolders {
+			fmt.Printf("  Thread %d\n", tid)
+		}
 	}
 }

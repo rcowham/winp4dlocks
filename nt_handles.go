@@ -36,7 +36,7 @@ var (
 	procNtQuerySystemInfo = ntdll.NewProc("NtQuerySystemInformation")
 )
 
-func enumP4DBHandles(p4pid uint32) []windows.Handle {
+func enumP4DBHandlePaths(p4pid uint32) []string {
 	bufSize := uint32(1 << 20)
 	buf := make([]byte, bufSize)
 
@@ -57,7 +57,13 @@ func enumP4DBHandles(p4pid uint32) []windows.Handle {
 	info := (*SYSTEM_HANDLE_INFORMATION_EX)(unsafe.Pointer(&buf[0]))
 	count := info.NumberOfHandles
 
-	var result []windows.Handle
+	var result []string
+
+	srcProc, err := windows.OpenProcess(windows.PROCESS_DUP_HANDLE, false, p4pid)
+	if err != nil {
+		return result
+	}
+	defer windows.CloseHandle(srcProc)
 
 	for i := uintptr(0); i < count; i++ {
 		h := (*SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX)(
@@ -70,9 +76,8 @@ func enumP4DBHandles(p4pid uint32) []windows.Handle {
 		}
 
 		// duplicate handle into our process
-		srcProc, _ := windows.OpenProcess(windows.PROCESS_DUP_HANDLE, false, p4pid)
 		var dup windows.Handle
-		windows.DuplicateHandle(
+		err = windows.DuplicateHandle(
 			srcProc,
 			windows.Handle(h.HandleValue),
 			windows.CurrentProcess(),
@@ -81,10 +86,15 @@ func enumP4DBHandles(p4pid uint32) []windows.Handle {
 			false,
 			windows.DUPLICATE_SAME_ACCESS,
 		)
+		if err != nil {
+			continue
+		}
 
 		name := getFileNameFromHandle(dup)
+		windows.CloseHandle(dup)
+
 		if strings.Contains(strings.ToLower(name), `\db.`) {
-			result = append(result, dup)
+			result = append(result, name)
 		}
 	}
 	return result
