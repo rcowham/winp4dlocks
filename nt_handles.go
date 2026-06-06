@@ -23,7 +23,6 @@ type SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX struct {
 	ObjectTypeIndex       uint16
 	HandleAttributes      uint32
 	Reserved              uint32
-	UniqueThreadId        uintptr
 }
 
 type SYSTEM_HANDLE_INFORMATION_EX struct {
@@ -33,8 +32,7 @@ type SYSTEM_HANDLE_INFORMATION_EX struct {
 }
 
 type DBHandleInfo struct {
-	Path     string
-	ThreadID uint32
+	Path string
 }
 
 var (
@@ -101,8 +99,7 @@ func enumP4DBHandlesByThread(p4pid uint32) []DBHandleInfo {
 
 		if strings.Contains(strings.ToLower(name), `\db.`) {
 			result = append(result, DBHandleInfo{
-				Path:     name,
-				ThreadID: uint32(h.UniqueThreadId),
+				Path: name,
 			})
 		}
 	}

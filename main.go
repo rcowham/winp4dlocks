@@ -5,8 +5,10 @@ package main
 import (
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -150,6 +152,67 @@ func findProcessByName(processes []WindowsProcess, name string) *WindowsProcess 
 	return nil
 }
 
+func findFirstProcessByNames(processes []WindowsProcess, names ...string) *WindowsProcess {
+	for _, name := range names {
+		if p := findProcessByName(processes, name); p != nil {
+			return p
+		}
+	}
+	return nil
+}
+
+func getThreadBlocker(tid uint32, session uintptr) (blocked bool, blockerPID uint32, blockerTID uint32, waitObj string) {
+	const WCT_MAX_NODE_COUNT = 16
+	var nodes [WCT_MAX_NODE_COUNT]WAITCHAIN_NODE_INFO
+	var count uint32 = WCT_MAX_NODE_COUNT
+	var cycle uint32
+
+	r, _, _ := procGetThreadWaitChain.Call(
+		session,
+		0,
+		0,
+		uintptr(tid),
+		uintptr(unsafe.Pointer(&count)),
+		uintptr(unsafe.Pointer(&nodes[0])),
+		uintptr(unsafe.Pointer(&cycle)),
+	)
+
+	if r == 0 || count < 2 {
+		return false, 0, 0, ""
+	}
+
+	if nodes[1].ObjectType == WctThreadType {
+		pid := *(*uint32)(unsafe.Pointer(&nodes[1].ObjectInfo[0]))
+		blocker := *(*uint32)(unsafe.Pointer(&nodes[1].ObjectInfo[4]))
+		return true, pid, blocker, ""
+	}
+
+	name := windows.UTF16ToString((*[WCT_OBJNAME_LENGTH]uint16)(unsafe.Pointer(&nodes[1].ObjectInfo[0]))[:])
+	return true, 0, 0, name
+}
+
+func getThreadBlockerWithTimeout(tid uint32, session uintptr, timeout time.Duration) (blocked bool, blockerPID uint32, blockerTID uint32, waitObj string, timedOut bool) {
+	type result struct {
+		blocked    bool
+		blockerPID uint32
+		blockerTID uint32
+		waitObj    string
+	}
+
+	ch := make(chan result, 1)
+	go func() {
+		b, pid, bt, obj := getThreadBlocker(tid, session)
+		ch <- result{blocked: b, blockerPID: pid, blockerTID: bt, waitObj: obj}
+	}()
+
+	select {
+	case r := <-ch:
+		return r.blocked, r.blockerPID, r.blockerTID, r.waitObj, false
+	case <-time.After(timeout):
+		return false, 0, 0, "", true
+	}
+}
+
 func newWindowsProcess(e *windows.ProcessEntry32) WindowsProcess {
 	// Find when the string ends for decoding
 	end := 0
@@ -168,25 +231,28 @@ func newWindowsProcess(e *windows.ProcessEntry32) WindowsProcess {
 }
 
 func main() {
+	const enableWaitChainAnalysis = false
 
 	procs, err := processes()
 	if err != nil {
 		log.Fatal(err)
 	}
-	for _, p := range procs {
-		fmt.Println(p.Exe)
-	}
-	p4p := findProcessByName(procs, "p4s.exe")
+	p4p := findFirstProcessByNames(procs, "p4d.exe", "p4s.exe")
 	if p4p == nil {
-		log.Fatal("p4s.exe not running")
+		log.Fatal("p4d.exe/p4s.exe not running")
 	}
 	// found it
-	fmt.Printf("p4s.exe pid: %d\n", p4p.ProcessID)
+	fmt.Printf("%s pid: %d\n", p4p.Exe, p4p.ProcessID)
 	p4pid := uint32(p4p.ProcessID)
 	handleInfos := enumP4DBHandlesByThread(p4pid)
 	println("db.* handles:", len(handleInfos))
 	for _, info := range handleInfos {
-		fmt.Printf("db handle: %s (thread %d)\n", info.Path, info.ThreadID)
+		fmt.Printf("db handle: %s\n", info.Path)
+	}
+
+	if !enableWaitChainAnalysis {
+		fmt.Println("\nThread-level wait-chain analysis is disabled because this API can hang on some systems.")
+		return
 	}
 
 	session, _, _ := procOpenThreadWaitChainSession.Call(1, 0)
@@ -194,19 +260,50 @@ func main() {
 
 	threads := enumThreads(p4pid)
 	fmt.Println("\n--- Thread Lock Status ---")
-	var activeLockHolders []uint32
+	blockerCounts := make(map[uint32]int)
+	timeoutCount := 0
 
 	for _, tid := range threads {
-		isActive := checkThreadBlockers(tid, session)
-		if isActive {
-			activeLockHolders = append(activeLockHolders, tid)
+		blocked, blockerPID, blockerTID, waitObj, timedOut := getThreadBlockerWithTimeout(tid, session, 250*time.Millisecond)
+		if timedOut {
+			timeoutCount++
+			fmt.Printf("Thread %d wait-chain query timed out\n", tid)
+			continue
+		}
+		if !blocked {
+			continue
+		}
+
+		if blockerTID != 0 {
+			fmt.Printf("Thread %d blocked by thread %d (pid %d)\n", tid, blockerTID, blockerPID)
+			if blockerPID == p4pid {
+				blockerCounts[blockerTID]++
+			}
+			continue
+		}
+
+		if waitObj != "" {
+			fmt.Printf("Thread %d waiting on %s\n", tid, waitObj)
+		} else {
+			fmt.Printf("Thread %d waiting on unknown object\n", tid)
 		}
 	}
 
-	if len(activeLockHolders) > 0 {
-		fmt.Println("\nThreads likely holding locks (not blocked):")
-		for _, tid := range activeLockHolders {
-			fmt.Printf("  Thread %d\n", tid)
+	if len(blockerCounts) > 0 {
+		fmt.Println("\nThreads likely holding contested locks (they block other p4 threads):")
+		tids := make([]uint32, 0, len(blockerCounts))
+		for tid := range blockerCounts {
+			tids = append(tids, tid)
 		}
+		sort.Slice(tids, func(i, j int) bool { return blockerCounts[tids[i]] > blockerCounts[tids[j]] })
+		for _, tid := range tids {
+			fmt.Printf("  Thread %d (blocking %d waiter(s))\n", tid, blockerCounts[tid])
+		}
+	} else {
+		fmt.Println("\nNo contested lock holder threads found in wait-chain data.")
+	}
+
+	if timeoutCount > 0 {
+		fmt.Printf("\nSkipped %d thread(s) because wait-chain queries timed out.\n", timeoutCount)
 	}
 }
